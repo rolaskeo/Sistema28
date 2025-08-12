@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+
+# Datos locales / DB / logs
+*.sqlite
+*.db
+*.log
+/tmp/
+.cache/
+
+# VS Code
+.vscode/
+
+# Modelos locales / checkpoints
+/models/
+checkpoints/
+
+# Datos masivos (mantener fuera del repo)
+data/
