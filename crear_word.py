@@ -1,97 +1,156 @@
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Pt, Cm
-from datetime import datetime
+"""
+crear_word.py — Módulo de exportación de dictámenes en DOCX usando una plantilla.
 
-def crear_word(titulo_consulta, cuerpo_secciones, referencias, ruta_salida):
+Requisitos:
+  pip install docxtpl
+
+Uso típico desde generar_dictamen.py:
+  from crear_word import exportar_dictamen_docx
+  exportar_dictamen_docx(contexto, "dictamenes/2025-08-12-dictamen.docx")
+
+La plantilla esperada (por defecto): templates/Dictamen_modelo_1.docx
+Debe incluir placeholders Jinja2 como {{titulo}}, {{fecha}}, {{referencias}},
+{{consulta_concreta}}, {{palabras_clave}}, {{cuerpo}}, {{firmante}}, {{organismo}}.
+
+Si tu plantilla tiene secciones (Antecedentes/Análisis/Conclusión) podés usar
+{{antecedentes}}, {{analisis}}, {{conclusion}} dentro de {{cuerpo}} o por separado.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Dict, Optional, Sequence
+import os
+
+try:
+    from docxtpl import DocxTemplate
+except ImportError as e:  # pragma: no cover
+    raise SystemExit(
+        "Falta docxtpl. Instalá: pip install docxtpl"
+    ) from e
+
+
+DEFAULT_TEMPLATE = os.getenv("DICTAMEN_TEMPLATE", "templates/Dictamen_modelo_1.docx")
+
+
+@dataclass
+class DictamenContexto:
+    titulo: str
+    organismo: str = ""
+    fecha: str = date.today().strftime("%d/%m/%Y")
+    referencias: str = ""
+    consulta_concreta: str = ""
+    palabras_clave: Sequence[str] | str = ()
+    cuerpo: str = ""  # Texto completo (puede concatenar secciones)
+    antecedentes: str = ""
+    analisis: str = ""
+    conclusion: str = ""
+    firmante: str = "Rolando Keumurdji Rizzuti"
+
+    def to_mapping(self) -> Dict[str, str]:
+        """Convierte a dict listo para docxtpl, normalizando claves y listas."""
+        palabras = self.palabras_clave
+        if isinstance(palabras, (list, tuple)):
+            palabras = ", ".join([p for p in palabras if p])
+        return {
+            "titulo": self.titulo or "Dictamen Jurídico",
+            "fecha": self.fecha or date.today().strftime("%d/%m/%Y"),
+            "organismo": self.organismo or "",
+            "referencias": self.referencias or "",
+            "consulta_concreta": self.consulta_concreta or "",
+            "palabras_clave": palabras or "",
+            "cuerpo": self.cuerpo or _unir_secciones(self.antecedentes, self.analisis, self.conclusion),
+            "antecedentes": self.antecedentes or "",
+            "analisis": self.analisis or "",
+            "conclusion": self.conclusion or "",
+            "firmante": self.firmante or "",
+        }
+
+
+def _unir_secciones(antecedentes: str, analisis: str, conclusion: str) -> str:
+    partes = []
+    if antecedentes:
+        partes.append("I. ANTECEDENTES\n" + antecedentes.strip())
+    if analisis:
+        partes.append("II. ANÁLISIS\n" + analisis.strip())
+    if conclusion:
+        partes.append("III. CONCLUSIÓN\n" + conclusion.strip())
+    return "\n\n".join(partes)
+
+
+def exportar_dictamen_docx(
+    contexto: Dict[str, str] | DictamenContexto,
+    salida: str | os.PathLike,
+    template_path: Optional[str | os.PathLike] = None,
+) -> Path:
     """
-    Genera un documento Word con formato PTN adaptado a Sistema 28.
+    Renderiza la plantilla y guarda el DOCX en `salida`.
 
-    Args:
-        titulo_consulta (str): Tema de consulta.
-        cuerpo_secciones (list): Lista de secciones con formato:
-                                 [("I. ANTECEDENTES", ["texto1", "texto2"]), ...]
-                                 donde cada párrafo puede contener referencias tipo [1].
-        referencias (dict): Diccionario {numero: texto} con notas al final.
-        ruta_salida (str): Ruta donde guardar el .docx
+    - `contexto` puede ser `DictamenContexto` o un `dict` compatible.
+    - `template_path` por defecto toma DEFAULT_TEMPLATE.
 
-    Returns:
-        str: Ruta final del archivo generado.
+    El template debe contener los placeholders Jinja2 que quieras usar.
+    Placeholders soportados por este módulo:
+      {{titulo}}, {{fecha}}, {{organismo}}, {{referencias}},
+      {{consulta_concreta}}, {{palabras_clave}}, {{cuerpo}},
+      {{antecedentes}}, {{analisis}}, {{conclusion}}, {{firmante}}
     """
+    tpl_path = Path(template_path or DEFAULT_TEMPLATE)
+    if not tpl_path.exists():
+        raise FileNotFoundError(
+            f"No se encontró la plantilla DOCX en: {tpl_path}. "
+            "Asegurate de colocar tu modelo en esa ruta o pasar template_path explícito."
+        )
 
-    doc = Document()
+    if isinstance(contexto, DictamenContexto):
+        ctx = contexto.to_mapping()
+    elif isinstance(contexto, dict):
+        # normalizar llaves faltantes para evitar KeyError en el template
+        base = DictamenContexto(titulo=contexto.get("titulo", "Dictamen Jurídico"))
+        base.organismo = contexto.get("organismo", base.organismo)
+        base.fecha = contexto.get("fecha", base.fecha)
+        base.referencias = contexto.get("referencias", base.referencias)
+        base.consulta_concreta = contexto.get("consulta_concreta", base.consulta_concreta)
+        base.palabras_clave = contexto.get("palabras_clave", base.palabras_clave)
+        base.cuerpo = contexto.get("cuerpo", base.cuerpo)
+        base.antecedentes = contexto.get("antecedentes", base.antecedentes)
+        base.analisis = contexto.get("analisis", base.analisis)
+        base.conclusion = contexto.get("conclusion", base.conclusion)
+        base.firmante = contexto.get("firmante", base.firmante)
+        ctx = base.to_mapping()
+    else:  # pragma: no cover
+        raise TypeError("contexto debe ser DictamenContexto o dict")
 
-    # Encabezado
-    encabezado = doc.add_paragraph("S28 v.1.0")
-    encabezado.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    run = encabezado.runs[0]
-    run.font.name = "Times New Roman"
-    run.font.size = Pt(10)
+    tpl = DocxTemplate(str(tpl_path))
+    tpl.render(ctx)
 
-    # Título principal
-    titulo = doc.add_paragraph("DICTAMEN JURÍDICO")
-    titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = titulo.runs[0]
-    run.font.name = "Times New Roman"
-    run.font.size = Pt(14)
-    run.bold = True
+    out_path = Path(salida)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tpl.save(str(out_path))
+    return out_path
 
-    # Fecha y tema de consulta
-    fecha = doc.add_paragraph(datetime.now().strftime("%d/%m/%Y"))
-    fecha.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    fecha.runs[0].font.name = "Times New Roman"
-    fecha.runs[0].font.size = Pt(10)
 
-    tema = doc.add_paragraph(f"Tema de consulta: {titulo_consulta}")
-    tema.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    tema.runs[0].font.name = "Times New Roman"
-    tema.runs[0].font.size = Pt(12)
+# --- utilidad opcional para generar un nombre de archivo limpio ---
+import re
 
-    # Secciones y numeración de párrafos
-    for sec_idx, (titulo_sec, parrafos) in enumerate(cuerpo_secciones, start=1):
-        # Título de sección
-        sec = doc.add_paragraph(titulo_sec.upper())
-        sec.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        sec_run = sec.runs[0]
-        sec_run.font.name = "Times New Roman"
-        sec_run.font.size = Pt(12)
-        sec_run.bold = True
+def nombre_archivo_dictamen(titulo: str, fecha: Optional[datetime] = None, carpeta: str = "dictamenes") -> Path:
+    fecha = fecha or datetime.now()
+    base = re.sub(r"[^\w\-]+", "_", titulo.strip(), flags=re.UNICODE)
+    base = re.sub(r"_+", "_", base).strip("_")
+    return Path(carpeta) / f"{fecha.strftime('%Y-%m-%d')}-{base or 'Dictamen'}.docx"
 
-        # Párrafos numerados
-        for par_idx, texto in enumerate(parrafos, start=1):
-            par = doc.add_paragraph()
-            par.paragraph_format.first_line_indent = Cm(1.25)
-            par.paragraph_format.line_spacing = 1.5
-            par.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            run = par.add_run(f"{sec_idx}.{par_idx} {texto}")
-            run.font.name = "Times New Roman"
-            run.font.size = Pt(12)
 
-    # Firma
-    doc.add_paragraph("")
-    firma = doc.add_paragraph("Dr. Rolando Keumurdji Rizzuti")
-    firma.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    run_firma = firma.runs[0]
-    run_firma.font.name = "Times New Roman"
-    run_firma.font.size = Pt(12)
-
-    # Media línea separadora
-    doc.add_paragraph("_" * 50).alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-    # Notas al final
-    if referencias:
-        notas = doc.add_paragraph("Referencias:")
-        notas.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        notas.runs[0].bold = True
-        notas.runs[0].font.name = "Times New Roman"
-        notas.runs[0].font.size = Pt(10)
-
-        for num, ref in referencias.items():
-            ref_par = doc.add_paragraph(f"[{num}] {ref}")
-            ref_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            ref_par.paragraph_format.first_line_indent = Cm(0)
-            ref_par.runs[0].font.name = "Times New Roman"
-            ref_par.runs[0].font.size = Pt(10)
-
-    doc.save(ruta_salida)
-    return ruta_salida
+if __name__ == "__main__":  # pequeña prueba manual
+    ctx = DictamenContexto(
+        titulo="Dictamen Jurídico – Ejemplo",
+        organismo="Ministerio X",
+        referencias="Expte. 123/2025",
+        consulta_concreta="Naturaleza de la oferta.",
+        palabras_clave=["Oferta", "Licitación Pública", "Contratación Pública"],
+        antecedentes="Descripción breve de antecedentes…",
+        analisis="Análisis del caso…",
+        conclusion="Conclusiones y recomendaciones…",
+    )
+    salida = nombre_archivo_dictamen(ctx.titulo)
+    ruta = exportar_dictamen_docx(ctx, salida)
+    print(f"Dictamen generado en: {ruta}")
