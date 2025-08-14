@@ -25,3 +25,10 @@ checkpoints/
 
 # Datos masivos (mantener fuera del repo)
 data/
+uploads/
+backups/
+dictamenes/
+faiss_index.bin
+faiss_metadata.json
+sistema28.db
+.env
