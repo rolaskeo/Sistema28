@@ -1,17 +1,22 @@
 """
-S28 – Paso 2 (completo): Carga + Exploración/Descarga (Streamlit)
+S28 – Paso 2 (con notas al pie y número de página): Carga + Exploración/Descarga (Streamlit)
 
 Ejecutar:
   streamlit run streamlit_carga.py
 
 Requisitos (instalar una vez):
-  pip install streamlit python-dotenv sentence-transformers faiss-cpu pypdf
+  pip install streamlit python-dotenv sentence-transformers faiss-cpu pypdf pymupdf
 
 Lee variables desde .env (en la raíz del proyecto):
   DATABASE_PATH, FAISS_INDEX_PATH, FAISS_METADATA_PATH, EMBEDDING_MODEL
   (opcional) BACKUPS_DIR, BACKUP_RETENTION, UPLOADS_DIR
 
-Funcionalidad:
+Novedad de esta versión:
+- **Separación de texto principal vs. pie de página** (PyMuPDF) para PDFs con notas.
+- **Inyección inline** del texto de cada nota al pie cuando se detecta un marcador en el chunk.
+- **Tabla `footnotes`** en la DB (document_id, page, marker, texto) + guardado del **número de página** en cada chunk.
+
+Funcionalidad existente:
 - Página **Inicio** con métricas y accesos.
 - Página **Cargar**: Título/Tipo obligatorios, PDF(s), Palabras clave opcionales, Valoración por tipo.
   • Dedup por doc_hash (PDF) y por chunk_hash (texto de chunk).  
@@ -64,7 +69,7 @@ except Exception as e:  # pragma: no cover
     HAVE_GEN = False
     GEN_IMPORT_ERR = str(e)
 
-# PDF reader
+# PDF readers
 try:
     from pypdf import PdfReader
 except Exception:  # pragma: no cover
@@ -72,6 +77,13 @@ except Exception:  # pragma: no cover
         from PyPDF2 import PdfReader  # type: ignore
     except Exception as e:  # pragma: no cover
         raise SystemExit("Instalá pypdf o PyPDF2: pip install pypdf") from e
+
+# PyMuPDF (layout-aware) para detectar pie de página
+try:
+    import fitz  # PyMuPDF
+    HAVE_FITZ = True
+except Exception:
+    HAVE_FITZ = False
 
 # Embeddings
 try:
@@ -100,6 +112,7 @@ DICTAMENES_DIR = Path(os.getenv("DICTAMENES_DIR", "dictamenes"))
 TIPOS = [
     "sentencia",
     "norma",
+    "Doctrina",
     "opinion_propia",
     "dictamen_generado",
     "informe_tecnico",
@@ -110,6 +123,7 @@ TIPOS = [
 TIPO_PESO = {
     "sentencia": 1.3,
     "norma": 1.2,
+    "Doctrina": 0.9,
     "opinion_propia": 1.0,
     "dictamen_generado": 0.9,
     "informe_tecnico": 1.1,
@@ -161,10 +175,10 @@ def cargar_modelo():
 
 def abrir_db():
     # Abrimos una conexión NUEVA por llamada (sin cachear) y apta para hilos de Streamlit
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
-    con.execute("PRAGMA foreign_keys=ON;")
+    con.execute("PRAGMA busy_timeout=60000;")  # esperar hasta 60s si hay lock
     # Crear tablas base si no existen
     con.execute(
         """
@@ -176,7 +190,9 @@ def abrir_db():
             fecha TEXT,
             path TEXT,
             doc_hash TEXT UNIQUE,
-            created_at TEXT
+            created_at TEXT,
+            keywords TEXT,
+            valor_tipo REAL
         );
         """
     )
@@ -194,27 +210,37 @@ def abrir_db():
         cur = con.execute(f"PRAGMA table_info({table});")
         return any(r[1] == col for r in cur.fetchall())
 
-    # documents: keywords, valor_tipo
-    if not has_col("documents", "keywords"):
-        con.execute("ALTER TABLE documents ADD COLUMN keywords TEXT;")
-    if not has_col("documents", "valor_tipo"):
-        con.execute("ALTER TABLE documents ADD COLUMN valor_tipo REAL;")
-
-    # document_chunks: asegurar columnas requeridas
+    # document_chunks: asegurar columnas requeridas (incluye page)
     for col, ddl in [
         ("document_id", "INTEGER"),
         ("chunk_text", "TEXT"),
         ("chunk_hash", "TEXT"),
         ("tipo", "TEXT"),
         ("posicion", "INTEGER"),
+        ("page", "INTEGER"),  # <<--- NUEVO
     ]:
         if not has_col("document_chunks", col):
             con.execute(f"ALTER TABLE document_chunks ADD COLUMN {col} {ddl};")
+
+    # Tabla de notas al pie
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS footnotes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL,
+            page INTEGER NOT NULL,
+            marker INTEGER NOT NULL,
+            texto TEXT,
+            UNIQUE(document_id, page, marker)
+        );
+        """
+    )
 
     # Índices
     con.execute("CREATE INDEX IF NOT EXISTS ix_documents_tipo ON documents(tipo);")
     con.execute("CREATE INDEX IF NOT EXISTS ix_chunks_docid ON document_chunks(document_id);")
     con.execute("CREATE INDEX IF NOT EXISTS ix_chunks_tipo ON document_chunks(tipo);")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_footnotes_doc ON footnotes(document_id);")
 
     # Índice único en chunk_hash (limpiando duplicados si hiciera falta)
     try:
@@ -287,6 +313,8 @@ def rotar_backups(db: str = DB_PATH, faiss_bin: Path = FAISS_BIN, faiss_meta: Pa
                 pass
 
 
+# -------- Normalización / chunking --------
+
 def pdf_a_texto(file_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(file_bytes))
     partes = []
@@ -332,6 +360,118 @@ def chunkear(texto: str, max_palabras=50) -> List[str]:
     if bloque:
         salida.append(". ".join(bloque) + ".")
     return salida
+
+
+# -------- Notas al pie (layout-aware) --------
+
+FOOTNOTE_MARKER_RE = re.compile(r"(?:\[(\d{1,2})\]|(?<!\d)\^?(\d{1,2})(?!\d))")
+
+
+def pdf_iter_pages_fitz(file_bytes: bytes):
+    """
+    Itera páginas devolviendo (page_no, main_text, footnotes_dict).
+    Usa PyMuPDF para separar zona principal vs. pie de página por geometría y patrón.
+    Si PyMuPDF no está disponible, cae a extracción plana con pypdf (sin notas).
+    """
+    if not HAVE_FITZ:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        for i, p in enumerate(reader.pages, start=1):
+            txt = p.extract_text() or ""
+            yield i, txt, {}
+        return
+
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    for i in range(doc.page_count):
+        page = doc.load_page(i)
+        pdict = page.get_text("dict")  # bloques/lineas/spans con coords y tamaños
+        H = float(page.rect.height)
+        foot_top = H * 0.82  # último ~18% como candidato a pie
+
+        main_lines, foot_lines = [], []
+        for block in pdict.get("blocks", []):
+            for line in block.get("lines", []):
+                y0 = min((s["bbox"][1] for s in line.get("spans", [])), default=0.0)
+                text = "".join(s.get("text", "") for s in line.get("spans", []))
+                text = text.strip()
+                if not text:
+                    continue
+                looks_foot = (y0 >= foot_top) or re.match(r"^\s*\[?\d{1,2}\]?[)\.\-–—]\s+\S", text)
+                if looks_foot:
+                    foot_lines.append(text)
+                else:
+                    main_lines.append(text)
+
+        main_text = "\n".join(main_lines)
+
+        notas: dict[int, str] = {}
+        for ln in foot_lines:
+            m = re.match(r"^\s*\[?(\d{1,2})\]?[)\.\-–—]\s*(.+)$", ln)
+            if m:
+                n = int(m.group(1)); txt = m.group(2).strip()
+                if n in notas:
+                    notas[n] = (notas[n] + " " + txt).strip()
+                else:
+                    notas[n] = txt
+
+        yield i + 1, main_text, notas  # páginas 1-indexed
+
+
+def inyectar_notas_inline(chunk: str, notas: dict[int, str]) -> str:
+    """Inserta ' [n.X: ...]' junto a cada marcador si existe la nota."""
+    def repl(m):
+        n = m.group(1) or m.group(2)
+        try:
+            n = int(n)
+        except:
+            return m.group(0)
+        if n in notas and notas[n]:
+            return f"{m.group(0)} [n.{n}: {notas[n]}]"
+        return m.group(0)
+    return FOOTNOTE_MARKER_RE.sub(repl, chunk)
+
+# --------- Utilidades de citas / referencias ---------
+
+def extraer_anio(fecha_str: str | None) -> str:
+    """Devuelve solo el año (YYYY) a partir de 'YYYY-MM' o 'YYYY-MM-DD'.
+    Si no puede parsear, devuelve 's/f' (sin fecha)."""
+    if not fecha_str:
+        return "s/f"
+    try:
+        # Intento ISO estricto
+        y = datetime.fromisoformat(fecha_str[:10]).year
+        return str(y)
+    except Exception:
+        m = re.search(r"(19|20)\d{2}", fecha_str)
+        return m.group(0) if m else "s/f"
+
+
+# -------- Búsqueda semántica (sumarios) --------
+
+def buscar_sumarios_semantico(consulta: str, top_k: int = 5, filtro_tipo: str | None = None):
+    index, meta = cargar_faiss()
+    if index.ntotal == 0 or not consulta.strip():
+        return []
+    model = cargar_modelo()
+    q_emb = model.encode([consulta.strip()], normalize_embeddings=True).astype("float32")
+    k = max(top_k * 4, 10)  # sobre-muestreo para re-rank
+    D, I = index.search(q_emb, min(k, index.ntotal))
+    resultados = []
+    for idx, score in zip(I[0], D[0]):
+        m = meta[idx]
+        if filtro_tipo and m.get("tipo") != filtro_tipo:
+            continue
+        w = float(m.get("valor_tipo", 1.0))
+        bonus = 0.0
+        kws = (m.get("keywords") or "")
+        if kws:
+            kl = [k.strip().lower() for k in kws.split(",") if k.strip()]
+            ch_low = (m.get("chunk_text", "").lower())
+            if any(kk and kk in ch_low for kk in kl):
+                bonus += 0.02
+        final = float(score) * w + bonus
+        resultados.append((final, m))
+    resultados.sort(key=lambda x: x[0], reverse=True)
+    return [m for _, m in resultados[:top_k]]
 
 # ======================== UI / NAVEGACIÓN ========================
 
@@ -424,12 +564,12 @@ elif st.session_state["nav"] == "Generar":
         context_parts = []
         for i, hit in enumerate(hits, start=1):
             snippet = (hit.get("chunk_text") or "")[:1200]
-            header = (
-    f"[{i}] {hit.get('tipo_documento','')} | "
-    f"{hit.get('organismo_emisor','')} | "
-    f"{hit.get('fecha_documento','')}\n"
-)
-            context_parts.append(header + snippet)
+            autor = (hit.get('organismo_emisor') or hit.get('organismo') or '—')
+            titulo = hit.get('titulo','')
+            anio = extraer_anio(hit.get('fecha_documento'))
+            pag = hit.get('page','—')
+            header = f"[{i}] {autor} — {titulo} ({anio})" + (f" | pág. {pag}" if (pag not in (None, '—')) else "")
+            context_parts.append(header + "\n" + snippet)
         contexto_text = "\n\n".join(context_parts)
 
         system_prompt = (
@@ -443,7 +583,7 @@ elif st.session_state["nav"] == "Generar":
             f"Consulta: {consulta}\n\n"
             f"Contexto relevante:\n{contexto_text}\n\n"
             "Redactá el dictamen técnico-jurídico."
-)
+        )
 
         with st.spinner("🧠 Redactando con IA (DeepSeek)…"):
             try:
@@ -487,7 +627,13 @@ elif st.session_state["nav"] == "Cargar":
         with col2:
             tipo = st.selectbox("Tipo (obligatorio)", options=TIPOS, index=None, placeholder="Seleccioná…", key=f"tipo_{fid}")
         with col3:
-            fecha_doc = st.date_input("Fecha del documento", value=date.today(), key=f"fecha_{fid}")
+            fecha_doc = st.date_input(
+            "Fecha del documento",
+            value=date.today(),
+            min_value=date(1900, 1, 1),
+            max_value=date.today(),
+            key=f"fecha_{fid}"
+        )
         organismo = st.text_input("Organismo (opcional)", value="", key=f"org_{fid}")
         keywords_input = st.text_input("Palabras clave (coma separadas, opcional)", value="", key=f"kw_{fid}")
         # slider de valoración (peso) con default según tipo
@@ -504,8 +650,7 @@ elif st.session_state["nav"] == "Cargar":
             st.stop()
 
         # Normalizar palabras clave a una cadena 'a, b, c'
-        kw_items = [k.strip().lower() for k in (keywords_input or "").replace(";", ",").split(",") if k.strip()]
-        kw_str = ",".join(sorted(set(kw_items)))
+        kw_str = ",".join([k.strip() for k in (keywords_input or "").replace(";", ",").split(",") if k.strip()])
 
         con = abrir_db(); cur = con.cursor()
         index, meta = cargar_faiss()
@@ -538,7 +683,7 @@ elif st.session_state["nav"] == "Cargar":
                 if not p or not p.exists():
                     try:
                         saved_path = store_pdf_bytes(contenido, f.name, d_hash)
-                        cur.execute("UPDATE documents SET path=? WHERE id=?", (str(saved_path), doc_id))
+                        cur.execute("UPDATE documents SET path=? WHERE id= ?", (str(saved_path), doc_id))
                         st.info(f"Documento existente: se restauró el archivo en disco ({saved_path.name}).")
                     except Exception as e:
                         st.warning(f"Documento existente pero no se pudo restaurar el archivo: {e}")
@@ -572,54 +717,69 @@ elif st.session_state["nav"] == "Cargar":
                 doc_id = cur.lastrowid
                 nuevos_docs += 1
 
-            # Extraer texto y limpiar líneas que igualan el título
-            texto_raw = pdf_a_texto(contenido)
-            texto = limpiar_titulo_del_texto(texto_raw, titulo)
+            # ----------- NUEVO: procesar por página con notas al pie -----------
+            for page_no, page_text, notas in pdf_iter_pages_fitz(contenido):
+                page_text = limpiar_titulo_del_texto(page_text, titulo)
 
-            # Chunkear y vectorizar
-            for i, ch in enumerate(chunkear(texto, max_palabras=50)):
-                ch = ch.strip()
-                if not ch:
-                    continue
-                c_hash = sha256_text(ch)
-                try:
-                    cur.execute(
-                        """
-                        INSERT INTO document_chunks (document_id, chunk_text, chunk_hash, tipo, posicion)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (doc_id, ch, c_hash, tipo, i),
-                    )
-                except sqlite3.IntegrityError:
-                    continue  # chunk ya existente (por hash)
+                # Guardar notas en tabla (no interrumpe si falla)
+                if notas:
+                    try:
+                        for marker, ntext in notas.items():
+                            cur.execute(
+                                "INSERT OR IGNORE INTO footnotes (document_id, page, marker, texto) VALUES (?, ?, ?, ?)",
+                                (doc_id, page_no, int(marker), ntext),
+                            )
+                    except Exception:
+                        pass
 
-                # enriquecer embedding con keywords (si existen) de manera ligera
-                text_for_emb = f"{ch} [KW: {kw_str}]" if kw_str else ch
-                emb = model.encode([text_for_emb], normalize_embeddings=True)
+                for i, ch in enumerate(chunkear(page_text, max_palabras=50)):
+                    ch = ch.strip()
+                    if not ch:
+                        continue
+                    # Inyectar notas inline según marcadores presentes en el chunk
+                    ch = inyectar_notas_inline(ch, notas)
 
-                # Si la dim del índice no coincide, recrear y limpiar metadatos para evitar corrupción
-                if hasattr(index, 'd') and index.d != emb.shape[1]:
-                    st.warning("Dimensión de FAISS distinta a la del modelo. Se recrea el índice y metadatos.")
-                    index = faiss.IndexFlatIP(emb.shape[1])
-                    meta = []
+                    c_hash = sha256_text(ch)
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO document_chunks (document_id, chunk_text, chunk_hash, tipo, posicion, page)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (doc_id, ch, c_hash, tipo, i, page_no),
+                        )
+                    except sqlite3.IntegrityError:
+                        continue  # chunk ya existente (por hash)
 
-                index.add(np.ascontiguousarray(emb.astype("float32")))
-                meta.append({
-                    "document_id": doc_id,
-                    "titulo": titulo.strip(),
-                    "tipo": tipo,
-                    "posicion": i,
-                    "hash": c_hash,
-                    "valor_tipo": float(valor_tipo),
-                    "keywords": kw_str,
-                    # Campos necesarios para generar_dictamen.py
-                    "chunk_text": ch,
-                    "document_path": str(saved_path) if 'saved_path' in locals() else (str(p) if 'p' in locals() and p else ""),
-                    "tipo_documento": tipo,
-                    "organismo_emisor": organismo.strip(),
-                    "fecha_documento": fecha_doc.isoformat(),
-                })
-                nuevos_chunks += 1
+                    # enriquecer embedding con keywords (si existen) de manera ligera
+                    text_for_emb = f"{ch} [KW: {kw_str}]" if kw_str else ch
+                    emb = model.encode([text_for_emb], normalize_embeddings=True)
+
+                    # Si la dim del índice no coincide, recrear y limpiar metadatos para evitar corrupción
+                    if hasattr(index, 'd') and index.d != emb.shape[1]:
+                        st.warning("Dimensión de FAISS distinta a la del modelo. Se recrea el índice y metadatos.")
+                        index = faiss.IndexFlatIP(emb.shape[1])
+                        meta = []
+
+                    index.add(np.ascontiguousarray(emb.astype("float32")))
+                    meta.append({
+                        "document_id": doc_id,
+                        "titulo": titulo.strip(),
+                        "tipo": tipo,
+                        "posicion": i,
+                        "page": page_no,              # << página
+                        "hash": c_hash,
+                        "valor_tipo": float(valor_tipo),
+                        "keywords": kw_str,
+                        # Campos necesarios para generar_dictamen.py
+                        "chunk_text": ch,
+                        "document_path": str(saved_path) if 'saved_path' in locals() else (str(p) if 'p' in locals() and p else ""),
+                        "tipo_documento": tipo,
+                        "organismo_emisor": organismo.strip(),
+                        "fecha_documento": fecha_doc.isoformat(),
+                    })
+                    nuevos_chunks += 1
+            # ----------- FIN NUEVO -----------
 
         # Persistir cambios
         con.commit(); con.close()
@@ -650,72 +810,155 @@ elif st.session_state["nav"] == "Buscar/Descargar":
         st.metric("Documentos totales", total)
     with c2:
         st.write("**Por tipo**:")
-    
         if por_tipo:
             for t, c in por_tipo:
                 st.write(f"- **{t}**: {c}")
         else:
             st.caption("Sin documentos aún.")
 
+    # -------- BÚSQUEDA POR TÍTULO --------
     st.subheader("Buscar por título")
-    with st.expander("Filtros avanzados (opcional)"):
-        cfd, cfh = st.columns(2)
-        with cfd:
-            f_desde = st.date_input("Desde", value=None)
-        with cfh:
-            f_hasta = st.date_input("Hasta", value=None)
+    with st.form("form_buscar_titulo"):
+        bt_col1, bt_col2 = st.columns([3,1])
+        with bt_col1:
+            q = st.text_input(
+                "Texto a buscar en títulos",
+                value="",
+                placeholder="Ej.: naturaleza del contrato… o expte 123",
+                key="q_tit",
+            )
+        with bt_col2:
+            filtro_tipo = st.selectbox(
+                "Filtrar por tipo",
+                options=["(Todos)"] + TIPOS,
+                index=0,
+                key="filtro_tit",
+            )
+        go_title = st.form_submit_button("Buscar títulos", use_container_width=True)
 
-# ...
-    if f_desde:
-        where.append("date(fecha) >= date(?)"); args.append(f_desde.isoformat())
-    if f_hasta:
-        where.append("date(fecha) <= date(?)"); args.append(f_hasta.isoformat())
+    if go_title:
+        where = []
+        args: List[object] = []
+        if q.strip():
+            where.append("LOWER(titulo) LIKE ?")
+            args.append(f"%{q.strip().lower()}%")
+        if filtro_tipo != "(Todos)":
+            where.append("tipo = ?")
+            args.append(filtro_tipo)
+        sql = "SELECT id, titulo, tipo, fecha, organismo, path FROM documents"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT 200"  # safety
 
-    bt_col1, bt_col2 = st.columns([3,1])
-    with bt_col1:
-        q = st.text_input("Texto a buscar en títulos", value="", placeholder="Ej.: naturalez… o expte 123")
-    with bt_col2:
-        filtro_tipo = st.selectbox("Filtrar por tipo", options=["(Todos)"] + TIPOS, index=0)
+        rows = cur.execute(sql, tuple(args)).fetchall()
 
-    where = []
-    args: List[object] = []
-    if q.strip():
-        where.append("LOWER(titulo) LIKE ?")
-        args.append(f"%{q.strip().lower()}%")
-    if filtro_tipo != "(Todos)":
-        where.append("tipo = ?")
-        args.append(filtro_tipo)
-    sql = "SELECT id, titulo, tipo, fecha, organismo, path FROM documents"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY id DESC LIMIT 200"  # safety
+        if not rows:
+            st.info("Sin resultados (ajustá el texto o el tipo).")
+        else:
+            st.write(f"Resultados: {len(rows)}")
+            for (doc_id, titulo, tipo, fecha, organismo, path) in rows:
+                # contar sumarios (equivalentes a 'chunks' almacenados) de ese documento
+                try:
+                    c2 = con.cursor()
+                    sumarios_cnt = c2.execute("SELECT COUNT(*) FROM document_chunks WHERE document_id=?", (doc_id,)).fetchone()[0]
+                except Exception:
+                    sumarios_cnt = None
+                with st.expander(f"#{doc_id} — {titulo}  ·  {tipo}  ·  {fecha}"):
+                    st.caption(f"Organismo: {organismo or '—'}")
+                    if sumarios_cnt is not None:
+                        st.caption(f"**Sumarios (párrafos relevantes) en este documento:** {sumarios_cnt}")
+                    p = Path(path) if path else None
+                    if p and p.exists():
+                        try:
+                            data = p.read_bytes()
+                            st.download_button(
+                                label="⬇️ Descargar PDF",
+                                data=data,
+                                file_name=p.name,
+                                mime="application/pdf",
+                                key=f"dl_{doc_id}",
+                                use_container_width=True,
+                            )
+                        except Exception as e:
+                            st.error(f"No se pudo leer el archivo: {e}")
+                    else:
+                        st.warning("Archivo no disponible en disco (registro antiguo o ruta inválida).")
 
-    rows = cur.execute(sql, tuple(args)).fetchall()
-    con.close()
+    # -------- BÚSQUEDA POR SUMARIO (CONTENIDO) --------
+    st.subheader("Buscar sumarios por contenido")
+    sq1, sq2, sq3 = st.columns([3,1,1])
+    with sq1:
+        qsum = st.text_input("Texto a buscar en el contenido", value="", placeholder="Ej.: caducidad del contrato, interés público…")
+    with sq2:
+        tipo_sem = st.selectbox("Filtrar tipo (contenido)", options=["(Todos)"] + TIPOS, index=0)
+    with sq3:
+        topk = st.slider("Top-K", 3, 10, 5, 1)
+    use_ai = st.checkbox("Búsqueda inteligente (IA): 3–5 bullets con citas [i]", value=False)
+    go_sem = st.button("Buscar sumarios (contenido)", use_container_width=True)
 
-    if not rows:
-        st.info("Sin resultados (ajustá el texto o el tipo).")
-    else:
-        st.write(f"Resultados: {len(rows)}")
-        for (doc_id, titulo, tipo, fecha, organismo, path) in rows:
-            with st.expander(f"#{doc_id} — {titulo}  ·  {tipo}  ·  {fecha}"):
-                st.caption(f"Organismo: {organismo or '—'}")
-                p = Path(path) if path else None
-                if p and p.exists():
+    if go_sem:
+        filtro = None if tipo_sem == "(Todos)" else tipo_sem
+        hits = buscar_sumarios_semantico(qsum, top_k=topk, filtro_tipo=filtro)
+        if not hits:
+            st.info("Sin resultados por contenido.")
+        else:
+            for i, h in enumerate(hits, start=1):
+                titulo_h = h.get("titulo", "")
+                page_h = h.get("page")
+                tipo_h = h.get("tipo")
+                ch = (h.get("chunk_text") or "")[:700]
+                autor_h = (h.get("organismo_emisor") or h.get("organismo") or "—")
+                anio_h = extraer_anio(h.get("fecha_documento"))
+                pag_h = page_h if page_h else "—"
+                st.markdown(f"**[{i}]** {autor_h} — *{titulo_h}* ({anio_h})" + (f", pág. {pag_h}" if pag_h != "—" else ""))
+                st.caption(f"Tipo: {tipo_h}")
+                st.write(ch)
+                p = Path(h.get("document_path") or "")
+                if p.exists():
                     try:
-                        data = p.read_bytes()
                         st.download_button(
-                            label="⬇️ Descargar PDF",
-                            data=data,
+                            "⬇️ Descargar PDF",
+                            data=p.read_bytes(),
                             file_name=p.name,
                             mime="application/pdf",
-                            key=f"dl_{doc_id}",
+                            key=f"dl_sem_{i}",
                             use_container_width=True,
                         )
                     except Exception as e:
-                        st.error(f"No se pudo leer el archivo: {e}")
-                else:
-                    st.warning("Archivo no disponible en disco (registro antiguo o ruta inválida).")
+                        st.warning(f"No se pudo ofrecer descarga: {e}")
+                st.divider()
+
+            if use_ai and HAVE_GEN:
+                parts = []
+                for i, h in enumerate(hits, start=1):
+                    autor = (h.get('organismo_emisor') or h.get('organismo') or '—')
+                    titulo = h.get('titulo','')
+                    anio = extraer_anio(h.get('fecha_documento'))
+                    pag = h.get('page','—')
+                    head = f"[{i}] {autor} — {titulo} ({anio})" + (f" | pág. {pag}" if pag != '—' else "")
+                    body = (h.get('chunk_text') or '')[:700]
+                    parts.append(head + "\n" + body)
+                ctx = "\n\n".join(parts)
+
+                system = (
+                    "Sos un asistente jurídico. Resumí y cruzá la información SOLO del contexto numerado; "
+                    "no inventes. Entregá 3–5 bullets concisos con citas [i]."
+                )
+                user = (
+                    f"Consulta: {qsum}\n\nContexto numerado:\n{ctx}\n\n"
+                    "Dame bullets del tipo: 'en [i] sostuviste X (opinión propia), apoyada en [j] (sentencia), "
+                    "pero [k] (doctrina) presenta una postura distinta'."
+                )
+
+                with st.spinner("IA preparando síntesis con citas…"):
+                    try:
+                        ai_text = call_remote_model(system, user, max_tokens=500, temperature=0.2)
+                        st.markdown("**Síntesis (IA):**")
+                        st.write(ai_text)
+                    except Exception as e:
+                        st.warning(f"No se pudo invocar la IA: {e}")
+
+    con.close()
 
     st.divider()
     if st.button("⬅ Volver al Inicio", use_container_width=True):
