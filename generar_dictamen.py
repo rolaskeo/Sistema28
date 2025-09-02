@@ -24,6 +24,13 @@ from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
+from pathlib import Path
+
+# --- v3: búsqueda híbrida desde s28 ---
+import sys
+sys.path.append(os.getcwd())  # para que VSCode/Streamlit encuentre el paquete local 's28'
+from s28.rerank import search as v3_search
+
 # ---------------- CONFIG ----------------
 load_dotenv()
 
@@ -37,6 +44,8 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
 DB_PATH = os.getenv("DATABASE_PATH", "sistema28.db")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "dictamenes")
+TEMPLATE_PATH = os.getenv("DICTAMEN_TEMPLATE", "plantillas/dictamen_ptn.docx")
+DICTAMEN_ESTRUCTURA_PATH = os.getenv("DICTAMEN_ESTRUCTURA", "plantilla/estructura.json")
 MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", 5))
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", 0.35))
 
@@ -145,6 +154,44 @@ def get_topk_chunks(query_text, k=MAX_CONTEXT_CHUNKS):
             })
     return hits
 
+# --- NUEVO (v3): recuperar top-k con FTS→coseno→meta→MMR ---
+def get_topk_chunks_v3(db_path: str, query: str, k: int = MAX_CONTEXT_CHUNKS, candidates: int = 200):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = lambda c,r:{d[0]: r[i] for i,d in enumerate(c.description)}
+    rows = v3_search(conn, query, topk=k, candidates=candidates, with_snippet=True)
+
+    # Enriquecer con issuer/year en un solo query (para encabezados)
+    doc_ids = list({int(r["doc_id"]) for r in rows})
+    meta = {}
+    if doc_ids:
+        qmarks = ",".join("?" for _ in doc_ids)
+        mrows = conn.execute(f"SELECT id, issuer, year FROM documents_v3 WHERE id IN ({qmarks})", doc_ids).fetchall()
+        meta = {int(r["id"]): {"issuer": r["issuer"], "year": r["year"]} for r in mrows}
+
+    conn.close()
+
+    hits = []
+    for r in rows:
+        dm = meta.get(int(r["doc_id"]), {})
+        issuer = dm.get("issuer") or ""
+        year   = dm.get("year") or ""
+        hits.append({
+            # campos compatibles con tu UI/flujo
+            "id":       r["chunk_id"],     # id del chunk para citas internas
+            "doc_id":   r["doc_id"],
+            "titulo":   r["title"],
+            "page":     r["page"],         # en PDF viene número; DOCX suele ser None
+            "chunk_text": r.get("text") or r.get("snippet") or "",
+            "preview":  r.get("snippet") or "",
+            "score":    r["score"],
+            "path":     r["path"],
+            # mapeo a los nombres legacy (para encabezados existentes)
+            "organismo_emisor": issuer,
+            "fecha_documento":  str(year) if year else "",
+            "tipo_documento":   "",        # no lo tenemos en v3; queda vacío
+        })
+    return hits
+
 # ---------------- remote model call (OpenRouter / DeepSeek) ----------------
 def call_remote_model(system_msg, user_msg, max_tokens=1024, temperature=0.2, attempts=3, timeout=30):
     if not API_KEY:
@@ -209,6 +256,47 @@ def associate_paragraphs_with_sources(full_text, top_k_per_par=3, similarity_thr
         results.append((p, best_meta if best_sim >= similarity_threshold else None, float(best_sim)))
     return results
 
+# --- NUEVO: completar referencias vacías con hits v3 ---
+def backfill_refs_from_v3(associated_paragraphs, v3_hits, sim_threshold=0.30, prefer_v3=True, margin=0.05):
+    """
+    Si 'prefer_v3' es True, V3 puede REEMPLAZAR la meta encontrada por FAISS cuando:
+      - no hay meta FAISS, o
+      - el mejor match de V3 tiene similitud >= sim_threshold y es >= (sim_FAISS + margin).
+    """
+    if not v3_hits:
+        return associated_paragraphs
+
+    v3_texts, v3_meta = [], []
+    for h in v3_hits:
+        txt = (h.get("chunk_text") or h.get("preview") or "").strip()
+        v3_texts.append(txt)
+        v3_meta.append({
+            "document_path": h.get("path") or h.get("document_path") or "",
+            "tipo_documento": h.get("tipo_documento") or "",
+            "organismo_emisor": h.get("organismo_emisor") or "",
+            "fecha_documento": h.get("fecha_documento") or "",
+            "chunk_text": txt,
+        })
+    if not any(v3_texts):
+        return associated_paragraphs
+
+    v3_vecs = embed_model.encode(v3_texts, convert_to_numpy=True)
+
+    out = []
+    for (p, meta, sim0) in associated_paragraphs:
+        p_vec = embed_model.encode([p], convert_to_numpy=True)[0]
+        sims = v3_vecs @ p_vec
+        best = int(np.argmax(sims))
+        best_score = float(sims[best])
+
+        # ¿reemplazar?
+        do_override = (not meta or not meta.get("document_path")) or (prefer_v3 and best_score >= max(sim0 or 0.0, 0.0) + margin)
+        if best_score >= sim_threshold and do_override:
+            out.append((p, v3_meta[best], best_score))
+        else:
+            out.append((p, meta, sim0))
+    return out
+
 # ---------------- create docx PTN (strict format) ----------------
 ROMAN_RE = re.compile(r'^\s*([IVXLCDM]+)\.\s*(.*)', flags=re.IGNORECASE)
 
@@ -220,46 +308,55 @@ def create_docx_ptn(consulta, associated_paragraphs):
     - After signature: horizontal separator and 'Notas y Referencias' (size 10).
     - References are collected from associated_paragraphs: unique by (path,tipo,org,fecha).
     """
-    doc = Document()
-    sec = doc.sections[0]
-    sec.top_margin = Cm(2.5)
-    sec.bottom_margin = Cm(2.0)
-    sec.left_margin = Cm(3.0)
-    sec.right_margin = Cm(2.5)
+    # Intentar abrir la plantilla definida en .env; si falla, fallback a documento en blanco.
+    use_template = False
+    try:
+        doc = Document(TEMPLATE_PATH)
+        use_template = True
+    except Exception:
+        doc = Document()
+    # >>> NUEVO: solo si NO hay plantilla, aplicamos formato PTN por defecto
+    if not use_template:
+        sec = doc.sections[0]
+        sec.top_margin = Cm(2.5)
+        sec.bottom_margin = Cm(2.0)
+        sec.left_margin = Cm(3.0)
+        sec.right_margin = Cm(2.5)
 
-    style = doc.styles['Normal']
-    style.font.name = 'Times New Roman'
-    style.font.size = Pt(12)
+        style = doc.styles['Normal']
+        style.font.name = 'Times New Roman'
+        style.font.size = Pt(12)
 
-    # Portada
-    title_p = doc.add_paragraph()
-    title_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-    run = title_p.add_run("Dictamen Jurídico")
-    run.bold = True
-    run.font.name = "Times New Roman"
-    run.font.size = Pt(14)
+        # Portada
+        title_p = doc.add_paragraph()
+        title_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        run = title_p.add_run("Dictamen Jurídico")
+        run.bold = True
+        run.font.name = "Times New Roman"
+        run.font.size = Pt(14)
 
-    doc.add_paragraph("")
-    fecha_p = doc.add_paragraph()
-    fecha_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-    fecha_p.add_run(datetime.now().strftime("%d de %B de %Y")).font.size = Pt(12)
+        doc.add_paragraph("")
+        fecha_p = doc.add_paragraph()
+        fecha_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        fecha_p.add_run(datetime.now().strftime("%d de %B de %Y")).font.size = Pt(12)
 
-    tema = consulta.strip() if len(consulta) < 250 else (consulta[:247] + "...")
-    tema_p = doc.add_paragraph()
-    tema_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-    tema_p.add_run(tema).font.size = Pt(12)
+        tema = consulta.strip() if len(consulta) < 250 else (consulta[:247] + "...")
+        tema_p = doc.add_paragraph()
+        tema_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        tema_p.add_run(tema).font.size = Pt(12)
 
-    doc.add_page_break()
+        doc.add_page_break()
 
-    # Header & footer
-    for s in doc.sections:
-        if s.header.paragraphs:
-            s.header.paragraphs[0].text = "S28 v.1.0"
-            s.header.paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
-        if s.footer.paragraphs:
-            f = s.footer.paragraphs[0]
-            f.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-            add_page_number_field(f, prefix_text="Página ")
+        # Header & footer
+        for s in doc.sections:
+            if s.header.paragraphs:
+                s.header.paragraphs[0].text = "S28 v.3.3"
+                s.header.paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
+            if s.footer.paragraphs:
+                f = s.footer.paragraphs[0]
+                f.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                add_page_number_field(f, prefix_text="Página ")
+# <<< FIN NUEVO
 
     # Body with section detection and numbering
     used_refs = []  # list of keys (path,tipo,org,fecha)
@@ -342,17 +439,33 @@ def create_docx_ptn(consulta, associated_paragraphs):
             r.bold = True
             r.font.size = Pt(10)
         else:
+            # --- fallbacks elegantes si faltan metadatos ---
+            tipo  = tipo or "Documento"
+            if not org:
+                org = Path(path).parent.name if path else ""
+            fecha = str(fecha) if fecha else ""
+            if not org and path:
+                org = Path(path).stem[:80]
+
+            # encabezado de la referencia
             b = ref_par.add_run(f"[{i}] {tipo} - {org} - {fecha}\n")
             b.bold = True
             b.font.size = Pt(10)
-            ref_par.add_run(f"Fuente: {path}\n").font.size = Pt(10)
-            # snippet lookup
-            found = None
-            for m in metadata.values():
-                if m.get("document_path","") == path:
-                    found = m
-                    break
-            snippet = normalize_text(found.get("chunk_text",""))[:350] + ("..." if found and len(found.get("chunk_text",""))>350 else "")
+
+            # mostrar solo el nombre de archivo (más legible que el path completo)
+            ref_par.add_run(f"Fuente: {Path(path).name if path else '—'}\n").font.size = Pt(10)
+
+            # snippet (robusto ante 'found=None')
+            snippet = ""
+            if path:
+                try:
+                    found = next((m for m in metadata.values() if m.get("document_path", "") == path), None)
+                    if found:
+                        ct = normalize_text(found.get("chunk_text", ""))
+                        if ct:
+                            snippet = ct[:350] + ("..." if len(ct) > 350 else "")
+                except Exception:
+                    pass
             if snippet:
                 ref_par.add_run(snippet).font.size = Pt(10)
         last_path = path
@@ -373,18 +486,21 @@ def save_dictamen_record(consulta, ruta_docx, modelo, top_hits):
     dictamen_id = cur.lastrowid
     for hit in top_hits:
         cur.execute("""
-            INSERT INTO antecedentes_relevantes (dictamen_id, chunk_idx, document_path, tipo_documento, organismo_emisor, fecha_documento, snippet, similitud)
+            INSERT INTO antecedentes_relevantes
+            (dictamen_id, chunk_idx, document_path, tipo_documento, organismo_emisor, fecha_documento, snippet, similitud)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            dictamen_id,
-            hit.get("idx"),
-            hit.get("document_path"),
-            hit.get("tipo_documento"),
-            hit.get("organismo_emisor"),
-            hit.get("fecha_documento"),
-            (hit.get("chunk_text")[:800] if hit.get("chunk_text") else ""),
-            hit.get("similitud")
-        ))
+        """, 
+            (
+                dictamen_id,
+                hit.get("idx") or hit.get("id") or hit.get("chunk_id"),
+                hit.get("document_path") or hit.get("path"),
+                hit.get("tipo_documento"),
+                hit.get("organismo_emisor"),
+                hit.get("fecha_documento"),
+                (hit.get("chunk_text")[:800] if hit.get("chunk_text") else ""),
+                hit.get("similitud", hit.get("score")),
+            )
+    )
     conn.commit()
     conn.close()
     return dictamen_id
@@ -447,7 +563,7 @@ def option_generate_dictamen():
         print("Consulta vacía. Abortando.")
         return
     print(f"📚 Recuperando hasta {MAX_CONTEXT_CHUNKS} bloques relevantes...")
-    hits = get_topk_chunks(consulta, k=MAX_CONTEXT_CHUNKS)
+    hits = get_topk_chunks_v3(DB_PATH, consulta, k=MAX_CONTEXT_CHUNKS)
     if not hits:
         print("No se encontraron antecedentes relevantes.")
         return
@@ -460,14 +576,33 @@ def option_generate_dictamen():
         context_parts.append(header + snippet)
     contexto_text = "\n\n".join(context_parts)
 
+    # Cargar estructura del dictamen desde JSON (si existe)
+    try:
+        with open(DICTAMEN_ESTRUCTURA_PATH, "r", encoding="utf-8") as f:
+            esquema = (json.load(f).get("secciones") or [])
+            esquema = [s for s in esquema if isinstance(s, str) and s.strip()]
+    except Exception:
+        esquema = []
+
+    if not esquema:
+        esquema = ["I. Antecedentes", "II. Análisis", "III. Conclusión"]  # fallback breve
+
+    epigrafes = "\n- " + "\n- ".join(esquema)  # para mostrarle al LLM “exactamente” estos títulos
+
     system_prompt = (
         "Sos un abogado experto en derecho administrativo argentino. "
         "Utilizá únicamente el contexto que te brindo para redactar un proyecto de dictamen jurídico. "
         "No inventes normas ni citas: si una norma es mencionada, debe estar textual en el contexto provisto. "
-        "Estructurá el dictamen en: I. Antecedentes; II. Análisis; III. Conclusión. "
+        "Estructurá el dictamen exactamente con estos epígrafes:" + epigrafes + " "
+        "Usá citas en formato [n] donde n refiere a las fuentes recuperadas. "
         "Aplicá el Manual de Estilo PTN 2023 en lo que corresponda."
     )
-    user_prompt = f"Consulta: {consulta}\n\nContexto relevante:\n{contexto_text}\n\nRedactá el dictamen técnico-jurídico."
+
+    user_prompt = (
+        f"Consulta: {consulta}\n\n"
+        f"Contexto relevante:\n{contexto_text}\n\n"
+        "Redactá el dictamen técnico-jurídico."
+    )
 
     print("🧠 Solicitando redacción al modelo (remoto)...")
     try:
@@ -481,6 +616,9 @@ def option_generate_dictamen():
 
     print("🔎 Asociando párrafos con fuentes (semántico)...")
     associated = associate_paragraphs_with_sources(response_text, top_k_per_par=3, similarity_threshold=SIMILARITY_THRESHOLD)
+    
+    # NUEVO: completar referencias con v3
+    associated = backfill_refs_from_v3(associated, hits)
 
     print("💾 Generando documento Word (formato PTN)...")
     filename = create_docx_ptn(consulta, associated)
@@ -498,7 +636,7 @@ def option_antecedentes_only():
     if not consulta:
         print("Consulta vacía. Abortando.")
         return
-    hits = get_topk_chunks(consulta, k=MAX_CONTEXT_CHUNKS)
+    hits = get_topk_chunks_v3(DB_PATH, consulta, k=MAX_CONTEXT_CHUNKS)
     if not hits:
         print("No se encontraron antecedentes.")
         return
@@ -512,9 +650,21 @@ def option_antecedentes_only():
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO antecedentes_relevantes (dictamen_id, chunk_idx, document_path, tipo_documento, organismo_emisor, fecha_documento, snippet, similitud, valoracion)
+                INSERT INTO antecedentes_relevantes
+                (dictamen_id, chunk_idx, document_path, tipo_documento, organismo_emisor, fecha_documento, snippet, similitud, valoracion)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (None, h.get("idx"), h.get("document_path"), h.get("tipo_documento"), h.get("organismo_emisor"), h.get("fecha_documento"), h.get("chunk_text")[:800], h.get("similitud"), int(val)))
+            """, 
+                (
+                    None,
+                    h.get("idx") or h.get("id") or h.get("chunk_id"),
+                    h.get("document_path") or h.get("path"),
+                    h.get("tipo_documento"),
+                    h.get("organismo_emisor"),
+                    h.get("fecha_documento"),
+                    (h.get("chunk_text")[:800] if h.get("chunk_text") else ""),
+                    h.get("similitud", h.get("score")),
+                    int(val),
+                ))
             conn.commit()
             conn.close()
     print("Operación finalizada. Las valoraciones guardadas.")

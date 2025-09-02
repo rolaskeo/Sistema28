@@ -32,3 +32,10 @@ faiss_index.bin
 faiss_metadata.json
 sistema28.db
 .env
+.env
+sistema28.db
+faiss_index.bin
+faiss_metadata.json
+uploads/
+dictamenes/
+backups/

@@ -383,6 +383,21 @@ def chunk_text(
         target_words=target_words,
         max_words=max_words,
     )
+    # Pegado del último chunk si quedó muy corto
+    merge_last_under = 55  # palabras
+    if len(chunks) >= 2 and chunks[-1].word_count < merge_last_under:
+        prev = chunks[-2]
+        last = chunks[-1]
+        merged_text = (prev.text.rstrip() + " " + last.text.lstrip()).strip()
+        chunks[-2] = Chunk(
+            text=merged_text,
+            start_char=prev.start_char,
+            end_char=last.end_char,
+            word_count=len(merged_text.split()),
+            sentence_count=prev.sentence_count + last.sentence_count,
+            notes="merged_tail"
+        )
+        chunks.pop()
     return chunks
 
 # ----------------------------
